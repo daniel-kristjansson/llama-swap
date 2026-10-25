@@ -531,6 +531,14 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	cmd.WaitDelay = p.waitDelay
 	setProcAttributes(cmd)
 
+	// Start gate: refuse to launch while the system does not have enough
+	// available memory (see waitAvailableMemory). Runs after the process is
+	// built but before it is started, so an aborted gate leaves no orphan.
+	if err := p.waitAvailableMemory(startCtx); err != nil {
+		cmdCancel()
+		return startResult{err: fmt.Errorf("start memory gate: %w", err)}
+	}
+
 	p.proxyLogger.Debugf("<%s> Executing start command: %s, env: %s", p.id, strings.Join(args, " "), strings.Join(p.config.Env, ", "))
 
 	cmdDone := make(chan struct{})

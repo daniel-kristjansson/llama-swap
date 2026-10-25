@@ -484,6 +484,17 @@
                         "pattern": "^/.*$|^none$",
                         "description": "URL path to check if the server is ready. Use 'none' to skip health checking. A non-200 response with a JSON body like {\"progress\": 0.42, \"message\": \"...\"} reports loading progress."
                     },
+                    "minAvailableMemory": {
+                        "type": "string",
+                        "default": "",
+                        "description": "Startup memory gate: do not run the start command until the OS reports at least this much available memory (e.g. \"20G\", \"512M\", \"1.5T\"; binary suffixes, or plain bytes). Empty (default) disables the gate. Protects against OOM when a previously stopped model is still holding memory."
+                    },
+                    "waitAvailableMemory": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Seconds to wait for minAvailableMemory to be satisfied before failing the start. 0 uses healthCheckTimeout, then 300s."
+                    },
                     "ttl": {
                         "type": "integer",
                         "minimum": -1,

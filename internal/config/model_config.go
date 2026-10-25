@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
+	"strings"
 )
 
 const (
@@ -160,6 +162,57 @@ type ModelConfig struct {
 
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
+
+	// MinAvailableMemory, when > 0, gates model startup on system memory:
+	// the start command is not executed until the OS reports at least this
+	// much available memory (MemAvailable on Linux), preventing a model
+	// load from OOM-killing unrelated processes (e.g. a desktop session)
+	// when a previously "stopped" model is still holding memory.
+	MinAvailableMemory string `yaml:"minAvailableMemory"`
+
+	// WaitAvailableMemory bounds how long startup blocks for the above
+	// memory to free up, in seconds. 0 (default) falls back to
+	// HealthCheckTimeout, then to 300s.
+	WaitAvailableMemory int `yaml:"waitAvailableMemory"`
+
+	// parsed at config load
+	minAvailableMemoryBytes uint64
+}
+
+// MinAvailableMemoryBytes returns the parsed startup memory gate threshold
+// in bytes. 0 means the gate is disabled.
+func (m *ModelConfig) MinAvailableMemoryBytes() uint64 {
+	return m.minAvailableMemoryBytes
+}
+
+// parseMinAvailableMemory parses values like "20G", "512M", "1.5G" (binary
+// suffixes K/M/G/T) or plain byte counts. Empty string means disabled.
+func parseMinAvailableMemory(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	var mult uint64 = 1
+	if r := s[len(s)-1]; r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
+		switch strings.ToUpper(s[len(s)-1:]) {
+		case "K":
+			mult = 1 << 10
+		case "M":
+			mult = 1 << 20
+		case "G":
+			mult = 1 << 30
+		case "T":
+			mult = 1 << 40
+		default:
+			return 0, fmt.Errorf("minAvailableMemory: unsupported suffix %q (use K, M, G or T)", s[len(s)-1:])
+		}
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("minAvailableMemory: invalid value %q", s)
+	}
+	return uint64(n * float64(mult)), nil
 }
 
 func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -198,6 +251,12 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err := unmarshal(&defaults); err != nil {
 		return err
 	}
+
+	bytes, err := parseMinAvailableMemory(defaults.MinAvailableMemory)
+	if err != nil {
+		return err
+	}
+	defaults.minAvailableMemoryBytes = bytes
 
 	*m = ModelConfig(defaults)
 	return nil
