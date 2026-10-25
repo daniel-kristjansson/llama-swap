@@ -98,23 +98,43 @@ func serveCmd(args []string) {
 				log.Fatalf("Failed to start daemon: %v", err)
 			}
 		} else {
-			// Wake up succeeded, now wait for healthy (liveness).
+			// Wake up succeeded: restore weights if this is a level-2 sleep,
+			// then wait for healthy (liveness).
+			if err := reloadVLLMWeightsIfNeeded(vllmURL, sleepLevel); err != nil {
+				log.Fatalf("Failed to reload weights after wake up: %v", err)
+			}
 			log.Printf("Wake up sent, waiting for healthy state")
 			if err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout); err != nil {
 				log.Fatalf("vLLM health check failed after wake up: %v", err)
 			}
 		}
 	} else {
-		// Reachable (liveness ok). Now wake up to ensure it's not asleep.
-		log.Printf("vLLM daemon is reachable at %s%s, attempting to wake up if asleep", vllmURL, healthPath)
-		if err := wakeUpVLLM(vllmURL); err != nil {
-			// Log the error but continue because wake is idempotent and we might be already awake.
-			log.Printf("Warning: wake up failed (but continuing): %v", err)
+		// Reachable (liveness ok). Note that /health answers 200 even while
+		// the engine is asleep, so query the sleep state directly.
+		log.Printf("vLLM daemon is reachable at %s%s, checking sleep state", vllmURL, healthPath)
+		asleep, err := isSleepingVLLM(vllmURL)
+		if err != nil {
+			// /is_sleeping is a dev endpoint; if it is unavailable, fall back
+			// to an unconditional wake, which is a no-op when already awake.
+			log.Printf("Warning: could not query sleep state (%v), waking up unconditionally", err)
+			asleep = true
 		}
-		// After waking, we wait for the daemon to become healthy again (liveness) to ensure it's ready.
-		log.Printf("Waiting for vLLM to be healthy after wake up")
-		if err := waitForHealthyWithPath(vllmURL, healthPath, 10*time.Second); err != nil {
-			log.Fatalf("vLLM health check failed after wake up: %v", err)
+		if !asleep {
+			log.Printf("vLLM daemon is awake; nothing to do")
+		} else {
+			if err := wakeUpVLLM(vllmURL); err != nil {
+				log.Fatalf("Wake up failed: %v", err)
+			}
+			log.Printf("Wake up complete")
+			if err := reloadVLLMWeightsIfNeeded(vllmURL, sleepLevel); err != nil {
+				log.Fatalf("Failed to reload weights after level-2 wake: %v", err)
+			}
+			// A level-2 wake re-loads weights from disk and can take a long
+			// time; use the full wait timeout rather than a short poll.
+			log.Printf("Waiting for vLLM to be healthy after wake up")
+			if err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout); err != nil {
+				log.Fatalf("vLLM health check failed after wake up: %v", err)
+			}
 		}
 	}
 
@@ -200,8 +220,10 @@ func sleepCmd(args []string) {
 		log.Fatalf("Failed to marshal sleep request: %v", err)
 	}
 
-	// Send POST to /sleep endpoint.
-	resp, err := http.Post(vllmURL+"/sleep", "application/json", strings.NewReader(string(jsonBody)))
+	// Send POST to /sleep endpoint. NOTE: the vLLM /sleep endpoint reads
+	// "level" from the query string, not the JSON body — send it there
+	// (keeping the body for compatibility/inspection).
+	resp, err := http.Post(fmt.Sprintf("%s/sleep?level=%d", vllmURL, sleepLevel), "application/json", strings.NewReader(string(jsonBody)))
 	if err != nil {
 		log.Fatalf("Failed to send sleep request: %v", err)
 	}
@@ -229,7 +251,8 @@ func sleepVLLM(vllmURL string, sleepLevel int) error {
 		return fmt.Errorf("failed to marshal sleep request: %w", err)
 	}
 
-	resp, err := http.Post(vllmURL+"/sleep", "application/json", strings.NewReader(string(jsonBody)))
+	// Same as sleepCmd: "level" must ride in the query string.
+	resp, err := http.Post(fmt.Sprintf("%s/sleep?level=%d", vllmURL, sleepLevel), "application/json", strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return fmt.Errorf("failed to send sleep request: %w", err)
 	}
@@ -254,6 +277,81 @@ func wakeUpVLLM(vllmURL string) error {
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		// Some versions might return 204 No Content.
 		return fmt.Errorf("/wake_up returned unexpected status %d: %s", resp.StatusCode, resp.Status)
+	}
+	return nil
+}
+
+// isSleepingVLLM queries GET /is_sleeping and reports whether the engine
+// is currently asleep.
+func isSleepingVLLM(vllmURL string) (bool, error) {
+	resp, err := http.Get(vllmURL + "/is_sleeping")
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("/is_sleeping returned status %d: %s", resp.StatusCode, resp.Status)
+	}
+	var out struct {
+		IsSleeping bool `json:"is_sleeping"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, fmt.Errorf("decoding /is_sleeping response: %w", err)
+	}
+	return out.IsSleeping, nil
+}
+
+// reloadVLLMWeightsIfNeeded restores model weights after a wake-up. Level-2
+// sleep discarded all weights (target model and any speculative draft
+// model); wake_up only re-allocates the memory. The weights must be
+// reloaded in place from disk, and the stale prefix cache dropped
+// afterwards. Level-1 (and default) wakes restore from the CPU backup and
+// need nothing extra.
+func reloadVLLMWeightsIfNeeded(vllmURL string, sleepLevel int) error {
+	if sleepLevel != 2 {
+		return nil
+	}
+	if err := reloadWeightsVLLM(vllmURL); err != nil {
+		return err
+	}
+	log.Printf("Weights reloaded after level-2 wake")
+	if err := resetPrefixCacheVLLM(vllmURL); err != nil {
+		return fmt.Errorf("resetting prefix cache: %w", err)
+	}
+	return nil
+}
+
+// reloadWeightsVLLM asks the engine to reload model weights in place from
+// disk. Required after a level-2 sleep, which discards the weights instead
+// of backing them up; a plain wake_up only re-allocates memory.
+func reloadWeightsVLLM(vllmURL string) error {
+	resp, err := http.Post(
+		vllmURL+"/collective_rpc",
+		"application/json",
+		strings.NewReader(`{"method":"reload_weights"}`),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to POST /collective_rpc reload_weights: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("/collective_rpc reload_weights returned status %d: %s", resp.StatusCode, resp.Status)
+	}
+	return nil
+}
+
+// resetPrefixCacheVLLM clears the prefix cache, which may reference stale
+// KV state after a sleep/wake cycle.
+func resetPrefixCacheVLLM(vllmURL string) error {
+	resp, err := http.Post(vllmURL+"/reset_prefix_cache", "application/json", strings.NewReader(""))
+	if err != nil {
+		return fmt.Errorf("failed to POST /reset_prefix_cache: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("/reset_prefix_cache returned status %d: %s", resp.StatusCode, resp.Status)
 	}
 	return nil
 }

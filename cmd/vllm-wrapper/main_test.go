@@ -40,6 +40,67 @@ func TestWakeUpVLLM(t *testing.T) {
 	}
 }
 
+func TestIsSleepingVLLM(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/is_sleeping" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Write([]byte(`{"is_sleeping":true}`))
+	}))
+	defer ts.Close()
+
+	asleep, err := isSleepingVLLM(ts.URL)
+	if err != nil {
+		t.Fatalf("isSleepingVLLM failed: %v", err)
+	}
+	if !asleep {
+		t.Errorf("expected is_sleeping=true")
+	}
+}
+
+func TestReloadWeightsVLLM(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/collective_rpc" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		body := make([]byte, r.ContentLength)
+		if _, err := r.Body.Read(body); err == nil {
+			if string(body) != `{"method":"reload_weights"}` {
+				t.Errorf("Unexpected body: %s", body)
+			}
+		}
+		w.Write([]byte(`{"results":[]}`))
+	}))
+	defer ts.Close()
+
+	if err := reloadWeightsVLLM(ts.URL); err != nil {
+		t.Fatalf("reloadWeightsVLLM failed: %v", err)
+	}
+
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts2.Close()
+
+	if err := reloadWeightsVLLM(ts2.URL); err == nil {
+		t.Errorf("reloadWeightsVLLM expected error for non-200 response")
+	}
+}
+
+func TestResetPrefixCacheVLLM(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/reset_prefix_cache" {
+			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	if err := resetPrefixCacheVLLM(ts.URL); err != nil {
+		t.Fatalf("resetPrefixCacheVLLM failed: %v", err)
+	}
+}
+
 func TestWaitForHealthy(t *testing.T) {
 	// Test successful health check
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
