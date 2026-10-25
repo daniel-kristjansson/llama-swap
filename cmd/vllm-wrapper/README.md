@@ -65,6 +65,23 @@ Benefits of argv-based startup:
 - Avoids shell parsing overhead.
 - Correctly preserves arguments containing spaces.
 
+### Sleep levels
+
+vLLM supports three sleep levels, selected with `--sleep-level` on both
+subcommands. The level must match between `serve` and `sleep`, because `serve`
+uses it to pick the default wake sequence:
+
+| Level | Effect | Wake cost |
+| --- | --- | --- |
+| 0 | Pauses scheduling only; GPU memory is unchanged | Cheapest; nothing to restore |
+| 1 | Offloads model weights to host RAM, discards KV cache | Fast; weights restored from host RAM |
+| 2 | Discards weights and KV cache; only buffers are kept | Slow; weights reloaded from disk |
+
+Level 0 does not free VRAM, so it does not help run a different model in the
+gap; it only stops the engine accepting work. Use level 1 to free VRAM while
+keeping fast wake-ups, and level 2 when host RAM cannot hold the weights or the
+weights are being replaced.
+
 ### As a model's `cmdStop`
 
 Configure your model's `cmdStop` to invoke `vllm-wrapper sleep`:
@@ -77,12 +94,13 @@ models:
       --vllm-url http://127.0.0.1:8000
       --stop-pid ${PID}
     # Optional flags:
-    #   --sleep-level: sleep level to use (default: 1)
+    #   --sleep-level: sleep level to use: 0 pauses scheduling only,
+    #     1 offloads weights to host RAM, 2 discards weights (default: 1)
     #   --stop-pid: PID of the serve proxy to terminate after a successful sleep request
 ```
 
 When llama-swap stops the model, it will:
-1. Send a sleep request to the vLLM daemon (POST to `/sleep` with JSON `{"level": 1}`).
+1. Send a sleep request to the vLLM daemon (POST to `/sleep?level=<level>`).
 2. If `--stop-pid` is provided, send SIGTERM to the specified `vllm-wrapper serve` process after the sleep request succeeds.
 3. Exit with status 0, leaving the vLLM daemon running but asleep while allowing llama-swap to complete the unload operation.
 
@@ -200,14 +218,64 @@ sudo -u llama env \
 
 ### serve subcommand
 
-1. **Health check**: Sends a GET request to `${vllm-url}${health-path}` (default `/health`). If the response is HTTP 200, the daemon is considered healthy and awake, and we proceed to step 4.
-2. **Wake up**: If the health check fails (non‑200 or connection error), send a POST request to `${vllm-url}/wake_up`. If the wake‑up succeeds (HTTP 200 or 204), proceed to step 4.
-3. **Start daemon**: If the wake‑up fails (indicating the daemon is not running), use the command specified after `--` (argv-based, launched via `exec.Command`). The wrapper starts the command as a child process, then waits for the daemon to become healthy by polling the health path.
+1. **Health check**: Sends a GET request to `${vllm-url}${health-path}` (default `/health`). If the response is HTTP 200, the daemon is considered healthy, and we proceed to step 4. Note that vLLM answers `/health` with 200 even while the engine is asleep, so the sleep state is confirmed separately with `GET /is_sleeping`.
+2. **Wake up**: If the daemon is asleep (or unreachable), run the wake sequence described below in order. Each step must return HTTP 200 or 204; the first failure aborts the remaining steps so a half-woken engine is never used. Then wait for the daemon to become healthy again.
+3. **Start daemon**: If the wake sequence fails (indicating the daemon is not running), use the command specified after `--` (argv-based, launched via `exec.Command`). The wrapper starts the command as a child process, then waits for the daemon to become healthy by polling the health path.
 4. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on `${PORT}` (or the address provided to `--listen`) that proxies all requests to the vLLM upstream URL. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`.
+
+### Wake sequence and `--wake-step`
+
+Waking a sleeping vLLM engine is not always a single request. The sequence is
+configured with repeatable `--wake-step` flags on the `serve` subcommand, each
+written as `'METHOD /path [json-body]'`. Steps run in the order given. The
+method defaults to `POST` when omitted, and the body must be valid JSON.
+
+When no `--wake-step` is given, the sequence is derived from `--sleep-level`:
+
+| Sleep level | Default wake sequence |
+| --- | --- |
+| 0 | `POST /wake_up` |
+| 1 | `POST /wake_up` |
+| 2 | `POST /wake_up {"tags":["weights"]}`, `POST /collective_rpc {"method":"reload_weights"}`, `POST /wake_up {"tags":["kv_cache"]}` |
+
+Level 2 discards the model weights rather than backing them up to host RAM, so
+the weights must be reloaded from disk after waking. Waking without tags would
+allocate the KV cache before the weights land, raising peak VRAM; the tagged
+sequence allocates weight memory, reloads, then allocates the KV cache, which
+is the order vLLM documents for level 2.
+
+The explicit form, for example if your vLLM build needs a different order or an
+extra call such as `/reset_prefix_cache`:
+
+```yaml
+cmd: |
+  vllm-wrapper serve
+  --vllm-url http://127.0.0.1:8000
+  --listen :${PORT}
+  --sleep-level 2
+  --wake-step 'POST /wake_up {"tags":["weights"]}'
+  --wake-step 'POST /collective_rpc {"method":"reload_weights"}'
+  --wake-step 'POST /wake_up {"tags":["kv_cache"]}'
+  --wake-step 'POST /reset_prefix_cache'
+  --
+  ${vllm}
+  serve
+  ${model_path}
+  --host 127.0.0.1
+  --port 8000
+  --enable-sleep-mode
+```
+
+Passing any `--wake-step` replaces the level-derived default entirely; steps are
+not merged with it.
+
+Each step is bounded by `--wake-step-timeout` (default `10m`). The default is
+generous because a `reload_weights` step reads the full model from disk; a step
+that exceeds it fails the sequence rather than blocking the swap indefinitely.
 
 ### sleep subcommand
 
-1. Sends a POST request to `${vllm-url}/sleep` with a JSON body `{"level": <level>}` where `<level>` is the sleep level (default 1).
+1. Sends a POST request to `${vllm-url}/sleep?level=<level>`, where `<level>` is the sleep level (default 1). The level is passed as a query parameter because vLLM's `/sleep` endpoint reads it from the query string, not the JSON body.
 2. If `--stop-pid` is provided, sends SIGTERM to the specified `vllm-wrapper serve` process after the sleep request succeeds.
 3. Exits with status 0, leaving the vLLM daemon running in sleep mode.
 
