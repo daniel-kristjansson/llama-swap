@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -91,7 +93,9 @@ func serveCmd(args []string) {
 				log.Fatalf("Failed to start daemon: %v", err)
 			}
 		} else {
-			if err := restoreAfterWake(vllmURL, sleepLevel); err != nil {
+			// The daemon answered wake_up, so it was asleep. Use the level it
+			// reports rather than the configured one; see getSleepState.
+			if err := restoreAfterWake(vllmURL, getSleepState(vllmURL)); err != nil {
 				log.Fatalf("Failed to restore weights after wake up: %v", err)
 			}
 			log.Printf("Wake up sent, waiting for healthy state")
@@ -101,19 +105,18 @@ func serveCmd(args []string) {
 		}
 	} else {
 		log.Printf("vLLM daemon is reachable at %s%s, checking sleep state", vllmURL, healthPath)
-		asleep, err := isSleepingVLLM(vllmURL)
-		if err != nil {
-			log.Printf("Warning: could not query sleep state (%v), waking up unconditionally", err)
-			asleep = true
-		}
-		if !asleep {
+		state := getSleepState(vllmURL)
+		if state == -1 {
 			log.Printf("vLLM daemon is awake; nothing to do")
 		} else {
+			if state != 2 && state != sleepLevel {
+				log.Printf("Warning: vLLM reports sleep level %d but --sleep-level is %d; using the reported level", state, sleepLevel)
+			}
 			if err := wakeUpVLLM(vllmURL); err != nil {
 				log.Fatalf("Wake up failed: %v", err)
 			}
-			log.Printf("Wake up started")
-			if err := restoreAfterWake(vllmURL, sleepLevel); err != nil {
+			log.Printf("Wake up started (sleep level %d)", state)
+			if err := restoreAfterWake(vllmURL, state); err != nil {
 				log.Fatalf("Failed to restore weights after level-2 wake: %v", err)
 			}
 			log.Printf("Waiting for vLLM to be healthy after wake up")
@@ -265,6 +268,79 @@ func isSleepingVLLM(vllmURL string) (bool, error) {
 		return false, fmt.Errorf("decoding /is_sleeping response: %w", err)
 	}
 	return out.IsSleeping, nil
+}
+
+// getSleepState reports the engine's sleep state as an integer:
+//
+//	-1  the engine is awake
+//	 0  the engine is asleep (level 0 pause)
+//	 1  the engine is asleep at level 1 (weights in CPU memory)
+//	 2  the engine is asleep at level 2 (weights discarded), or the state
+//	    could not be determined
+//
+// Level 2 is returned both when the engine reports a level-2 sleep and when
+// its state is unknown: an unknown state must be treated as the most
+// conservative case, because a level-2 restore on an awake engine is a
+// harmless no-op while skipping it on a level-2 sleep leaves the model
+// without weights. The level comes from vllm:engine_sleep_state in /metrics,
+// which reports the engine's actual state rather than what this wrapper
+// requested, so a mismatch between the serve and sleep subcommands cannot
+// cause a wrong restore. Falls back to /is_sleeping when /metrics is
+// unavailable or does not expose the metric.
+func getSleepState(vllmURL string) int {
+	if state, ok := sleepStateFromMetrics(vllmURL); ok {
+		return state
+	}
+	if asleep, err := isSleepingVLLM(vllmURL); err == nil && !asleep {
+		return -1
+	}
+	// Asleep, or the state could not be determined either way.
+	return 2
+}
+
+// sleepStateFromMetrics parses vllm:engine_sleep_state from the /metrics
+// endpoint. The metric is a gauge carrying a sleep_state label whose value is
+// 1 for the current state: "awake", "weights_offloaded" (level 1) or
+// "discard_all" (level 2). Reports false when the metric is unavailable, so
+// callers can fall back to /is_sleeping.
+func sleepStateFromMetrics(vllmURL string) (int, bool) {
+	resp, err := http.Get(vllmURL + "/metrics")
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "vllm:engine_sleep_state{") {
+			continue
+		}
+		// Format: vllm:engine_sleep_state{sleep_state="awake"} 1.0
+		end := strings.LastIndex(line, "}")
+		if end < 0 {
+			continue
+		}
+		value := strings.TrimSpace(line[end+1:])
+		if v, err := strconv.ParseFloat(value, 64); err != nil || v != 1 {
+			continue
+		}
+		switch {
+		case strings.Contains(line, `sleep_state="awake"`):
+			return -1, true
+		case strings.Contains(line, `sleep_state="weights_offloaded"`):
+			return 1, true
+		case strings.Contains(line, `sleep_state="discard_all"`):
+			return 2, true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, false
+	}
+	return 0, false
 }
 
 // restoreAfterWake finishes a level-2 wake-up.
