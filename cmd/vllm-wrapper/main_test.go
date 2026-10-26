@@ -260,6 +260,48 @@ func TestGetSleepStateIndeterminate(t *testing.T) {
 	}
 }
 
+func TestWakeEngine(t *testing.T) {
+	// A level-2 sleep must use the documented restore sequence and must not
+	// send a plain /wake_up first: after a level-2 sleep there is no weight
+	// backup to restore from.
+	var got []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	if err := wakeEngine(ts.URL, 2); err != nil {
+		t.Fatalf("wakeEngine(level=2) failed: %v", err)
+	}
+	want := []string{
+		"POST /wake_up?tags=weights",
+		"POST /collective_rpc?",
+		"POST /wake_up?tags=kv_cache",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("call count: got %d %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// Levels other than 2 wake in a single call.
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/wake_up" || r.URL.RawQuery != "" {
+			t.Errorf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts2.Close()
+	for _, level := range []int{-1, 0, 1} {
+		if err := wakeEngine(ts2.URL, level); err != nil {
+			t.Fatalf("wakeEngine(level=%d) failed: %v", level, err)
+		}
+	}
+}
+
 func TestWaitForHealthy(t *testing.T) {
 	// Test successful health check
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -95,8 +95,8 @@ func serveCmd(args []string) {
 		} else {
 			// The daemon answered wake_up, so it was asleep. Use the level it
 			// reports rather than the configured one; see getSleepState.
-			if err := restoreAfterWake(vllmURL, getSleepState(vllmURL)); err != nil {
-				log.Fatalf("Failed to restore weights after wake up: %v", err)
+			if err := wakeEngine(vllmURL, getSleepState(vllmURL)); err != nil {
+				log.Fatalf("Failed to wake vLLM: %v", err)
 			}
 			log.Printf("Wake up sent, waiting for healthy state")
 			if err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout); err != nil {
@@ -112,13 +112,10 @@ func serveCmd(args []string) {
 			if state != 2 && state != sleepLevel {
 				log.Printf("Warning: vLLM reports sleep level %d but --sleep-level is %d; using the reported level", state, sleepLevel)
 			}
-			if err := wakeUpVLLM(vllmURL); err != nil {
-				log.Fatalf("Wake up failed: %v", err)
+			if err := wakeEngine(vllmURL, state); err != nil {
+				log.Fatalf("Failed to wake vLLM: %v", err)
 			}
-			log.Printf("Wake up started (sleep level %d)", state)
-			if err := restoreAfterWake(vllmURL, state); err != nil {
-				log.Fatalf("Failed to restore weights after level-2 wake: %v", err)
-			}
+			log.Printf("Wake up complete (sleep level %d)", state)
 			log.Printf("Waiting for vLLM to be healthy after wake up")
 			if err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout); err != nil {
 				log.Fatalf("vLLM health check failed after wake up: %v", err)
@@ -343,7 +340,21 @@ func sleepStateFromMetrics(vllmURL string) (int, bool) {
 	return 0, false
 }
 
-// restoreAfterWake finishes a level-2 wake-up.
+// wakeEngine wakes an engine known to be asleep, given the sleep level it
+// reported. A level-2 sleep discarded the weights, so the documented restore
+// sequence starts with wake_up?tags=weights and must not be preceded by a
+// plain wake_up: that would restore the weights from a backup that does not
+// exist. Other levels wake in one call.
+func wakeEngine(vllmURL string, sleepLevel int) error {
+	if sleepLevel == 2 {
+		return restoreAfterWake(vllmURL, sleepLevel)
+	}
+	return wakeUpVLLM(vllmURL)
+}
+
+// restoreAfterWake finishes a level-2 wake-up. It performs the whole sequence
+// from vLLM's documentation: reallocate the weight memory, reload the weights
+// from disk in place, then reallocate the KV cache.
 func restoreAfterWake(vllmURL string, sleepLevel int) error {
 	if sleepLevel != 2 {
 		return nil
