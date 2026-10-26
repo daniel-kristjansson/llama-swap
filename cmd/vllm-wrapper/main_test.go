@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -87,17 +87,75 @@ func TestReloadWeightsVLLM(t *testing.T) {
 	}
 }
 
-func TestResetPrefixCacheVLLM(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/reset_prefix_cache" {
-			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+func TestSleepVLLM(t *testing.T) {
+	for _, level := range []int{1, 2} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/sleep" {
+				t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+			// vLLM reads the level from the query string only.
+			if got := r.URL.Query().Get("level"); got != strconv.Itoa(level) {
+				t.Errorf("level query param: got %q, want %d", got, level)
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		err := sleepVLLM(ts.URL, level)
+		ts.Close()
+		if err != nil {
+			t.Fatalf("sleepVLLM(level=%d) failed: %v", level, err)
 		}
-		w.WriteHeader(http.StatusNoContent)
+	}
+
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts2.Close()
+
+	if err := sleepVLLM(ts2.URL, 2); err == nil {
+		t.Errorf("sleepVLLM expected error for non-200 response")
+	}
+}
+
+func TestRestoreAfterWake(t *testing.T) {
+	// Level 1 needs no extra calls after a plain wake_up.
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
 
-	if err := resetPrefixCacheVLLM(ts.URL); err != nil {
-		t.Fatalf("resetPrefixCacheVLLM failed: %v", err)
+	if err := restoreAfterWake(ts.URL, 1); err != nil {
+		t.Fatalf("restoreAfterWake(level=1) failed: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("level 1 should not make extra calls, got %d", calls)
+	}
+
+	// Level 2 must run the documented sequence in order.
+	var got []string
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts2.Close()
+
+	if err := restoreAfterWake(ts2.URL, 2); err != nil {
+		t.Fatalf("restoreAfterWake(level=2) failed: %v", err)
+	}
+	want := []string{
+		"POST /wake_up?tags=weights",
+		"POST /collective_rpc?",
+		"POST /wake_up?tags=kv_cache",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("call count: got %d %v, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call[%d]: got %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
@@ -132,20 +190,6 @@ func TestWaitForHealthy(t *testing.T) {
 	}
 	if err != context.DeadlineExceeded {
 		t.Errorf("waitForHealthy expected context deadline exceeded, got %v", err)
-	}
-}
-
-func TestSleepCommandMarshal(t *testing.T) {
-	// We test the sleep command by checking the JSON marshaling we use in sleepCmd.
-	// Since sleepCmd is not easily unit-testable without exposing more, we test the structure.
-	body := map[string]int{"level": 1}
-	data, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("Failed to marshal: %v", err)
-	}
-	expected := `{"level":1}`
-	if string(data) != expected {
-		t.Errorf("Expected %s, got %s", expected, string(data))
 	}
 }
 

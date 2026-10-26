@@ -82,7 +82,7 @@ models:
 ```
 
 When llama-swap stops the model, it will:
-1. Send a sleep request to the vLLM daemon (POST to `/sleep` with JSON `{"level": 1}`).
+1. Send a sleep request to the vLLM daemon (POST to `/sleep?level=<level>`).
 2. If `--stop-pid` is provided, send SIGTERM to the specified `vllm-wrapper serve` process after the sleep request succeeds.
 3. Exit with status 0, leaving the vLLM daemon running but asleep while allowing llama-swap to complete the unload operation.
 
@@ -200,14 +200,15 @@ sudo -u llama env \
 
 ### serve subcommand
 
-1. **Health check**: Sends a GET request to `${vllm-url}${health-path}` (default `/health`). If the response is HTTP 200, the daemon is considered healthy and awake, and we proceed to step 4.
-2. **Wake up**: If the health check fails (non‑200 or connection error), send a POST request to `${vllm-url}/wake_up`. If the wake‑up succeeds (HTTP 200 or 204), proceed to step 4.
-3. **Start daemon**: If the wake‑up fails (indicating the daemon is not running), use the command specified after `--` (argv-based, launched via `exec.Command`). The wrapper starts the command as a child process, then waits for the daemon to become healthy by polling the health path.
-4. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on `${PORT}` (or the address provided to `--listen`) that proxies all requests to the vLLM upstream URL. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`.
+1. **Health check**: Sends a GET request to `${vllm-url}${health-path}` (default `/health`). If the response is HTTP 200, the daemon is reachable, so we proceed to step 2. Note that vLLM answers `/health` with 200 even while the engine is asleep, so reachability alone does not mean the engine is awake.
+2. **Sleep check**: Sends a GET request to `${vllm-url}/is_sleeping`. If the engine reports it is not sleeping, nothing more is needed; proceed to step 4. If `/is_sleeping` is unavailable, the wrapper assumes the engine is asleep and wakes it unconditionally.
+3. **Wake up**: Sends a POST request to `${vllm-url}/wake_up`. For a level‑2 sleep the wrapper then runs the documented restore sequence: `wake_up?tags=weights`, `collective_rpc` with `reload_weights`, and `wake_up?tags=kv_cache`. If the wake‑up succeeds (HTTP 200 or 204), wait for the daemon to become healthy again using the full `--wait-timeout` (a level‑2 reload reads the weights from disk), then proceed to step 4.
+4. **Start daemon**: If the daemon is unreachable, use the command specified after `--` (argv-based, launched via `exec.Command`). The wrapper starts the command as a child process, then waits for the daemon to become healthy by polling the health path.
+5. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on `${PORT}` (or the address provided to `--listen`) that proxies all requests to the vLLM upstream URL. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`.
 
 ### sleep subcommand
 
-1. Sends a POST request to `${vllm-url}/sleep` with a JSON body `{"level": <level>}` where `<level>` is the sleep level (default 1).
+1. Sends a POST request to `${vllm-url}/sleep?level=<level>` where `<level>` is the sleep level (default 1). vLLM reads the level from the query string only; a JSON body is ignored.
 2. If `--stop-pid` is provided, sends SIGTERM to the specified `vllm-wrapper serve` process after the sleep request succeeds.
 3. Exits with status 0, leaving the vLLM daemon running in sleep mode.
 
@@ -218,6 +219,7 @@ sudo -u llama env \
 - For production use, ensure the vLLM daemon is properly managed (e.g., restarted if it crashes) outside of this wrapper.
 - The wrapper does not handle TLS certificates; if your vLLM server uses HTTPS, provide the appropriate URL and ensure the system's root CAs are configured.
 - On SIGTERM, the wrapper sends a sleep request to vLLM (using the configured sleep level) before shutting down, then exits cleanly without killing the vLLM daemon.
+- The `/sleep`, `/wake_up` and `/is_sleeping` endpoints are only enabled when vLLM runs with `VLLM_SERVER_DEV_MODE=1`. Level 2 additionally requires `--enable-sleep-mode`.
 - The reverse proxy uses Go's default HTTP transport (`http.DefaultTransport`), so there is no fixed limit on how long it waits for response headers from vLLM. Long-running generations are bounded only by the client's own timeout.
 
 ## Building
