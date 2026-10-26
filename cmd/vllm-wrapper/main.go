@@ -353,46 +353,47 @@ func wakeEngine(vllmURL string, sleepLevel int) error {
 	return wakeUpVLLM(vllmURL)
 }
 
-// restoreAfterWake finishes a level-2 wake-up. It performs the whole sequence
-// from vLLM's documentation: reallocate the weight memory, reload the weights
-// from disk in place, then reallocate the KV cache.
-//
-// The split wake needs the tags parameter added in vLLM v0.8.3 (PR #15500).
-// Before that, wake_up took no argument and restored every allocation at
-// once, weights and KV cache together; the tags parameter only exists to
-// split that single restore. Older releases therefore reject a tagged
-// request, and for them a plain /wake_up restores both the weights and the
-// KV cache in one call. Only the reload remains: a level-2 sleep discarded
-// the weights from GPU memory as well as the CPU backup the plain wake would
-// have copied back, so they still have to come from disk. No separate KV
-// cache step is needed on that path, because the plain wake already
-// reallocated it.
 func restoreAfterWake(vllmURL string, sleepLevel int) error {
 	if sleepLevel != 2 {
 		return nil
 	}
-	if err := wakeUpVLLMTags(vllmURL, "weights"); err != nil {
-		if !errors.Is(err, errTagsUnsupported) {
-			return fmt.Errorf("waking weights: %w", err)
-		}
-		// Legacy vLLM without tags support: wake in one call, then reload.
-		log.Printf("vLLM does not support wake_up tags (needs v0.8.3+), using plain wake_up")
-		if err := wakeUpVLLM(vllmURL); err != nil {
-			return fmt.Errorf("legacy wake up: %w", err)
-		}
-		if err := reloadWeightsVLLM(vllmURL); err != nil {
-			return err
-		}
-		log.Printf("Weights reloaded after level-2 wake (legacy path)")
+	modernErr := sleep2RestoreModern(vllmURL)
+	if modernErr == nil {
 		return nil
 	}
+	if !errors.Is(modernErr, errTagsUnsupported) {
+		return modernErr
+	}
+	log.Printf("vLLM does not support wake_up tags (needs v0.8.3+), using the legacy method")
+	legacyErr := sleep2RestoreLegacy(vllmURL)
+	if legacyErr == nil {
+		return nil
+	}
+	return fmt.Errorf("both level-2 restore methods failed: modern: %v; legacy: %w", modernErr, legacyErr)
+}
+
+func sleep2RestoreModern(vllmURL string) error {
+	if err := wakeUpVLLMTags(vllmURL, "weights"); err != nil {
+		return fmt.Errorf("waking weights: %w", err)
+	}
 	if err := reloadWeightsVLLM(vllmURL); err != nil {
-		return err
+		return fmt.Errorf("reloading weights: %w", err)
 	}
 	log.Printf("Weights reloaded after level-2 wake")
 	if err := wakeUpVLLMTags(vllmURL, "kv_cache"); err != nil {
 		return fmt.Errorf("waking kv cache: %w", err)
 	}
+	return nil
+}
+
+func sleep2RestoreLegacy(vllmURL string) error {
+	if err := wakeUpVLLM(vllmURL); err != nil {
+		return fmt.Errorf("legacy wake up: %w", err)
+	}
+	if err := reloadWeightsVLLM(vllmURL); err != nil {
+		return fmt.Errorf("reloading weights: %w", err)
+	}
+	log.Printf("Weights reloaded after level-2 wake (legacy path)")
 	return nil
 }
 

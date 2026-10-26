@@ -303,11 +303,12 @@ func TestWakeEngine(t *testing.T) {
 }
 
 func TestRestoreAfterWakeLegacy(t *testing.T) {
-	// A pre-v0.8.3 server rejects the tags parameter with a 4xx. The wrapper
-	// must fall back to a plain /wake_up and still reload the weights, since a
-	// level-2 sleep discarded them. The plain wake restores every allocation
-	// at once on those releases, so no separate kv_cache wake is expected:
-	// the sequence below is the whole legacy path.
+	// A pre-v0.8.3 server rejects the tags parameter with a 4xx, so the modern
+	// split sequence fails on its first call. The wrapper must then fall back
+	// to the legacy method and still reload the weights, since a level-2 sleep
+	// discarded them. The plain wake restores every allocation at once on
+	// those releases, so no separate kv_cache wake is expected: the sequence
+	// below is modern's failed attempt followed by the whole legacy path.
 	var got []string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
@@ -338,7 +339,8 @@ func TestRestoreAfterWakeLegacy(t *testing.T) {
 }
 
 func TestRestoreAfterWakeServerError(t *testing.T) {
-	// A 5xx is a real failure, not a legacy server: no fallback, error returned.
+	// A 5xx means the server is broken, not old: fail fast without trying the
+	// legacy method, so the real error is not masked by a second attempt.
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -346,11 +348,90 @@ func TestRestoreAfterWakeServerError(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	if err := restoreAfterWake(ts.URL, 2); err == nil {
+	err := restoreAfterWake(ts.URL, 2)
+	if err == nil {
 		t.Fatal("restoreAfterWake expected an error for a 5xx response")
 	}
 	if calls != 1 {
 		t.Errorf("expected a single failed call and no fallback, got %d calls", calls)
+	}
+	if strings.Contains(err.Error(), "both") {
+		t.Errorf("a 5xx should not report both methods as failing: %v", err)
+	}
+}
+
+func TestRestoreAfterWakeBothFail(t *testing.T) {
+	// A 4xx on tags selects the legacy method; when that also fails the error
+	// must report both causes, so a broken server is not mistaken for an old
+	// one.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("tags") != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	err := restoreAfterWake(ts.URL, 2)
+	if err == nil {
+		t.Fatal("restoreAfterWake expected an error when both methods fail")
+	}
+	for _, want := range []string{"modern", "legacy"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention the %s method: %v", want, err)
+		}
+	}
+}
+
+func TestSleep2RestoreModern(t *testing.T) {
+	var got []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if err := sleep2RestoreModern(ts.URL); err != nil {
+		t.Fatalf("sleep2RestoreModern failed: %v", err)
+	}
+	want := []string{
+		"POST /wake_up?tags=weights",
+		"POST /collective_rpc?",
+		"POST /wake_up?tags=kv_cache",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("call count: got %d %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSleep2RestoreLegacy(t *testing.T) {
+	var got []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if err := sleep2RestoreLegacy(ts.URL); err != nil {
+		t.Fatalf("sleep2RestoreLegacy failed: %v", err)
+	}
+	want := []string{
+		"POST /wake_up?",
+		"POST /collective_rpc?",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("call count: got %d %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call[%d]: got %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
