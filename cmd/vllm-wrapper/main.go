@@ -358,9 +358,15 @@ func wakeEngine(vllmURL string, sleepLevel int) error {
 // from disk in place, then reallocate the KV cache.
 //
 // The split wake needs the tags parameter added in vLLM v0.8.3 (PR #15500).
-// Older releases reject the tagged request; for those the plain /wake_up is
-// sent instead and the reload runs after it. The reload still has to happen
-// because a level-2 sleep discarded the weights.
+// Before that, wake_up took no argument and restored every allocation at
+// once, weights and KV cache together; the tags parameter only exists to
+// split that single restore. Older releases therefore reject a tagged
+// request, and for them a plain /wake_up restores both the weights and the
+// KV cache in one call. Only the reload remains: a level-2 sleep discarded
+// the weights from GPU memory as well as the CPU backup the plain wake would
+// have copied back, so they still have to come from disk. No separate KV
+// cache step is needed on that path, because the plain wake already
+// reallocated it.
 func restoreAfterWake(vllmURL string, sleepLevel int) error {
 	if sleepLevel != 2 {
 		return nil

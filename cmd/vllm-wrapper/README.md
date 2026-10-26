@@ -250,7 +250,7 @@ sudo -u llama env \
 - The `/sleep`, `/wake_up` and `/is_sleeping` endpoints are only enabled when vLLM runs with `VLLM_SERVER_DEV_MODE=1`. Level 2 additionally requires `--enable-sleep-mode`.
 - `--sleep-level` chooses the level used when *sleeping*. On wake the wrapper uses the level the engine reports, so the two subcommands cannot disagree about how to restore. A mismatch is logged as a warning.
 - When `/metrics` is unavailable the wrapper falls back to `/is_sleeping`, which cannot distinguish levels. In that case a sleep is assumed to be level 2, so the full restore sequence runs; that is a no-op on an awake engine and is the safe choice for a level-2 sleep.
-- Level-2 wakes use the `wake_up` `tags` parameter added in vLLM v0.8.3 (PR #15500). Older releases reject the tagged request; the wrapper detects the 4xx and falls back to a plain `/wake_up`, then reloads the weights from disk.
+- Level-2 wakes use the `wake_up` `tags` parameter added in vLLM v0.8.3 (PR #15500). Before that, `wake_up` restored every allocation at once — weights and KV cache together — so the parameter only exists to split that single restore. Older releases reject the tagged request; the wrapper detects the 4xx and falls back to a plain `/wake_up`, which reallocates both the weights and the KV cache in one call, then reloads the weights from disk. The KV cache needs no separate step on that path.
 - The reverse proxy uses Go's default HTTP transport (`http.DefaultTransport`), so there is no fixed limit on how long it waits for response headers from vLLM. Long-running generations are bounded only by the client's own timeout.
 
 ## Building

@@ -305,7 +305,9 @@ func TestWakeEngine(t *testing.T) {
 func TestRestoreAfterWakeLegacy(t *testing.T) {
 	// A pre-v0.8.3 server rejects the tags parameter with a 4xx. The wrapper
 	// must fall back to a plain /wake_up and still reload the weights, since a
-	// level-2 sleep discarded them.
+	// level-2 sleep discarded them. The plain wake restores every allocation
+	// at once on those releases, so no separate kv_cache wake is expected:
+	// the sequence below is the whole legacy path.
 	var got []string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
