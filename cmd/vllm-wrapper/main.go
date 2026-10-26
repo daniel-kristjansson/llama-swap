@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -355,12 +356,29 @@ func wakeEngine(vllmURL string, sleepLevel int) error {
 // restoreAfterWake finishes a level-2 wake-up. It performs the whole sequence
 // from vLLM's documentation: reallocate the weight memory, reload the weights
 // from disk in place, then reallocate the KV cache.
+//
+// The split wake needs the tags parameter added in vLLM v0.8.3 (PR #15500).
+// Older releases reject the tagged request; for those the plain /wake_up is
+// sent instead and the reload runs after it. The reload still has to happen
+// because a level-2 sleep discarded the weights.
 func restoreAfterWake(vllmURL string, sleepLevel int) error {
 	if sleepLevel != 2 {
 		return nil
 	}
 	if err := wakeUpVLLMTags(vllmURL, "weights"); err != nil {
-		return fmt.Errorf("waking weights: %w", err)
+		if !errors.Is(err, errTagsUnsupported) {
+			return fmt.Errorf("waking weights: %w", err)
+		}
+		// Legacy vLLM without tags support: wake in one call, then reload.
+		log.Printf("vLLM does not support wake_up tags (needs v0.8.3+), using plain wake_up")
+		if err := wakeUpVLLM(vllmURL); err != nil {
+			return fmt.Errorf("legacy wake up: %w", err)
+		}
+		if err := reloadWeightsVLLM(vllmURL); err != nil {
+			return err
+		}
+		log.Printf("Weights reloaded after level-2 wake (legacy path)")
+		return nil
 	}
 	if err := reloadWeightsVLLM(vllmURL); err != nil {
 		return err
@@ -372,9 +390,15 @@ func restoreAfterWake(vllmURL string, sleepLevel int) error {
 	return nil
 }
 
-// wakeUpVLLMTags sends POST /wake_up?tags=<tag> for a partial wake-up. Only
-// the sleep endpoints understand "tags"; when the server rejects it we fall
-// back to the plain wake_up used by callers that do not need the split.
+// errTagsUnsupported reports that the server rejected a wake_up carrying the
+// tags parameter, which means the vLLM release predates v0.8.3 (PR #15500).
+// Callers use it to fall back to the plain wake_up.
+var errTagsUnsupported = errors.New("wake_up tags not supported")
+
+// wakeUpVLLMTags sends POST /wake_up?tags=<tag> for a partial wake-up. vLLM
+// v0.8.3 and later accept the tags parameter; earlier releases reject the
+// request, which is reported as errTagsUnsupported so the caller can fall
+// back to a plain wake_up.
 func wakeUpVLLMTags(vllmURL string, tag string) error {
 	resp, err := http.Post(
 		fmt.Sprintf("%s/wake_up?tags=%s", vllmURL, url.QueryEscape(tag)),
@@ -387,6 +411,12 @@ func wakeUpVLLMTags(vllmURL string, tag string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		// A 4xx means the server did not understand the request, which for a
+		// tagged wake_up indicates an unsupported tags parameter. A 5xx is a
+		// real failure and must not be mistaken for a legacy server.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return fmt.Errorf("/wake_up?tags=%s returned status %d: %s: %w", tag, resp.StatusCode, resp.Status, errTagsUnsupported)
+		}
 		return fmt.Errorf("/wake_up?tags=%s returned unexpected status %d: %s", tag, resp.StatusCode, resp.Status)
 	}
 	return nil

@@ -302,6 +302,56 @@ func TestWakeEngine(t *testing.T) {
 	}
 }
 
+func TestRestoreAfterWakeLegacy(t *testing.T) {
+	// A pre-v0.8.3 server rejects the tags parameter with a 4xx. The wrapper
+	// must fall back to a plain /wake_up and still reload the weights, since a
+	// level-2 sleep discarded them.
+	var got []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		if r.URL.Query().Get("tags") != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	if err := restoreAfterWake(ts.URL, 2); err != nil {
+		t.Fatalf("restoreAfterWake(level=2) failed: %v", err)
+	}
+	want := []string{
+		"POST /wake_up?tags=weights",
+		"POST /wake_up?",
+		"POST /collective_rpc?",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("call count: got %d %v, want %d %v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("call[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRestoreAfterWakeServerError(t *testing.T) {
+	// A 5xx is a real failure, not a legacy server: no fallback, error returned.
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	if err := restoreAfterWake(ts.URL, 2); err == nil {
+		t.Fatal("restoreAfterWake expected an error for a 5xx response")
+	}
+	if calls != 1 {
+		t.Errorf("expected a single failed call and no fallback, got %d calls", calls)
+	}
+}
+
 func TestWaitForHealthy(t *testing.T) {
 	// Test successful health check
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
